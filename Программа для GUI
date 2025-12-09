@@ -1,0 +1,503 @@
+import tkinter as tk  # Стандартная библиотека GUI в Python (реализация Tk)
+from tkinter import ttk, messagebox, scrolledtext  # Расширенные виджеты и диалоги
+import paho.mqtt.client as mqtt  # Лёгкий MQTT-клиент для IoT-приложений
+import threading  # Модуль для организации многопоточной обработки
+import time  # Функции времени и задержки
+import logging  # Модуль системного логирования
+from datetime import datetime  # Работа с временными метками
+import json  # Сериализация/десериализация конфигурационных данных
+
+# Настройка глобального логгера: формат и уровень детализации
+# Уровень INFO обеспечивает запись всех ключевых событий без избыточного шума
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+
+
+class LuxMeterApp:
+    """
+    Основной класс приложения, инкапсулирующий всю логику взаимодействия с пользователем
+    и сетевым стеком MQTT. Реализован как единый объект с внутренним состоянием,
+    обеспечивающий согласованность между GUI и удалённым устройством.
+    """
+    
+    def __init__(self, root):
+        """
+        Конструктор класса. Инициализирует:
+        - графическое окно (root window);
+        - параметры подключения к MQTT-брокеру;
+        - внутренние переменные состояния (Tkinter Variables);
+        - сетевой клиент и фоновый поток;
+        - графический интерфейс.
+        """
+        self.root = root
+        self.root.title("Умный люксметр")
+        self.root.geometry('900x700')
+        self.root.minsize(800, 600)  # Минимальный размер для корректного отображения
+        
+        # Параметры подключения к публичному MQTT-брокеру Wqtt.ru
+        # Используются учётные данные, полученные при регистрации
+        self.mqtt_broker = "m3.wqtt.ru"
+        self.mqtt_port = 14305
+        self.mqtt_username = "u_3ILZ4H"
+        self.mqtt_password = "YHuF46hH"
+        self.client_id = f"luxmeter_gui_{int(time.time())}"  # Уникальный идентификатор клиента
+        
+        # Словарь топиков MQTT, обеспечивающий гибкость и читаемость кода
+        # Следует принципу DRY (Don't Repeat Yourself)
+        self.topics = {
+            'data': 'luxmeter/data',               # Телеметрия: уровень освещённости
+            'command': 'luxmeter/command',         # Управляющие команды
+            'relay1': 'luxmeter/relay1',           # Состояние первого реле
+            'relay2': 'luxmeter/relay2',
+            'relay3': 'luxmeter/relay3',
+            'autolevels': 'luxmeter/autolevels',   # Динамическая настройка порогов
+            'manual': 'luxmeter/manual',           # Уровень ручного управления
+            'mode': 'luxmeter/mode',               # Переключение режимов
+            'mode_status': 'luxmeter/mode/status', # Текущий режим (для синхронизации)
+            'brightness': 'luxmeter/brightness',   # Уровень яркости (резерв)
+            'brightness_level': 'luxmeter/brightness/level',
+            'manual_level': 'luxmeter/manual/level',
+            'system_info': 'luxmeter/system/info', # Версия прошивки устройства
+            'system_thresholds': 'luxmeter/system/thresholds'  # Начальные пороги
+        }
+        
+        # Внутренние переменные состояния (Tkinter Variables)
+        # Используются для автоматической синхронизации GUI и логики
+        self.lux_value = tk.IntVar(value=0)
+        self.auto_mode = tk.BooleanVar(value=True)
+        self.manual_level = tk.IntVar(value=0)
+        # Пороговые значения по умолчанию соответствуют типичным условиям освещённости
+        self.threshold1 = tk.IntVar(value=400)
+        self.threshold2 = tk.IntVar(value=300)
+        self.threshold3 = tk.IntVar(value=200)
+        self.brightness_level = tk.IntVar(value=100)
+        
+        # Состояние реле (для визуальной индикации)
+        self.relay1_state = tk.BooleanVar(value=False)
+        self.relay2_state = tk.BooleanVar(value=False)
+        self.relay3_state = tk.BooleanVar(value=False)
+        
+        # Инициализация MQTT-клиента с аутентификацией
+        self.client = mqtt.Client(client_id=self.client_id)
+        self.client.username_pw_set(self.mqtt_username, self.mqtt_password)
+        # Назначение обработчиков событий (callback-функций)
+        self.client.on_connect = self.on_connect
+        self.client.on_message = self.on_message
+        self.client.on_disconnect = self.on_disconnect
+        
+        self.is_connected = False  # Флаг состояния подключения
+        
+        # Инициализация графического интерфейса
+        self.create_widgets()
+        
+        # Запуск фонового потока для обработки сетевых событий
+        # Использование daemon-потока обеспечивает корректное завершение приложения
+        self.mqtt_thread = threading.Thread(target=self.mqtt_loop, daemon=True)
+        self.mqtt_thread.start()
+        
+        # Запуск периодической проверки состояния соединения
+        self.check_connection_status()
+        
+        # Запрос текущих параметров устройства при старте
+        self.request_system_info()
+
+
+    def create_widgets(self):
+        """
+        Метод построения графического интерфейса.
+        Используется менеджер компоновки grid и Notebook-виджет для организации вкладок.
+        Каждый функциональный блок выделен в отдельный LabelFrame — это соответствует
+        принципам эргономичного проектирования человеко-машинного интерфейса.
+        """
+        # Создание вкладок (реализация многомодального интерфейса)
+        tab_control = ttk.Notebook(self.root)
+        tab_main = ttk.Frame(tab_control)
+        tab_settings = ttk.Frame(tab_control)
+        tab_logs = ttk.Frame(tab_control)
+        tab_control.add(tab_main, text='Основная панель')
+        tab_control.add(tab_settings, text='Настройки')
+        tab_control.add(tab_logs, text='Логи и история')
+        tab_control.pack(expand=1, fill='both', padx=10, pady=10)
+
+        # ====== ВКЛАДКА "ОСНОВНАЯ ПАНЕЛЬ" ======
+        frame_readings = ttk.LabelFrame(tab_main, text="Текущие показания")
+        frame_readings.grid(row=0, column=0, padx=10, pady=10, sticky='ew')
+
+        # Визуализация уровня освещённости с акцентом на читаемость (шрифт, цвет)
+        ttk.Label(frame_readings, text="Текущая освещенность:", font=('Arial', 12)).grid(row=0, column=0, padx=5, pady=5, sticky='w')
+        lux_label = ttk.Label(frame_readings, textvariable=self.lux_value, font=('Arial', 24, 'bold'), foreground='blue')
+        lux_label.grid(row=0, column=1, padx=5, pady=5)
+        ttk.Label(frame_readings, text="люкс", font=('Arial', 12)).grid(row=0, column=2, padx=5, pady=5, sticky='w')
+
+        # Временная метка последнего обновления — важный элемент для оценки
+        # целостности и актуальности данных в реальном времени
+        self.last_update_time = tk.StringVar(value="Никогда")
+        ttk.Label(frame_readings, text="Последнее обновление:").grid(row=1, column=0, padx=5, pady=5, sticky='w')
+        ttk.Label(frame_readings, textvariable=self.last_update_time).grid(row=1, column=1, columnspan=2, padx=5, pady=5, sticky='w')
+
+        # Индикатор состояния сетевого подключения с цветовой кодировкой
+        self.connection_status = tk.StringVar(value="Не подключен")
+        self.status_indicator = tk.Canvas(frame_readings, width=20, height=20, bg='red')
+        self.status_indicator.grid(row=2, column=3, padx=5, pady=5)
+        ttk.Label(frame_readings, text="Статус подключения:").grid(row=2, column=0, padx=5, pady=5, sticky='w')
+        ttk.Label(frame_readings, textvariable=self.connection_status, font=('Arial', 10, 'bold')).grid(row=2, column=1, columnspan=2)
+
+        # Отображение состояния исполнительных устройств (реле) с индикаторами и кнопками
+        frame_relays = ttk.LabelFrame(tab_main, text="Состояние освещения")
+        frame_relays.grid(row=1, column=0, padx=10, pady=10, sticky='ew')
+
+        # Заголовки таблицы состояний
+        ttk.Label(frame_relays, text="Лампа", font=('Arial', 10, 'bold')).grid(row=0, column=0)
+        ttk.Label(frame_relays, text="Статус", font=('Arial', 10, 'bold')).grid(row=0, column=1)
+        ttk.Label(frame_relays, text="Управление", font=('Arial', 10, 'bold')).grid(row=0, column=2)
+
+        # Динамический список индикаторов реле для централизованного обновления
+        self.relay_indicators = []
+
+        # Три строки для управления каждой лампой независимо
+        for i, lamp_name in enumerate(["Лампа 1", "Лампа 2", "Лампа 3"], start=1):
+            ttk.Label(frame_relays, text=lamp_name).grid(row=i, column=0, padx=5, pady=5, sticky='w')
+            indicator = tk.Canvas(frame_relays, width=30, height=30, bg='gray')
+            indicator.grid(row=i, column=1, padx=5, pady=5)
+            self.relay_indicators.append(indicator)
+            btn = ttk.Button(frame_relays, text="Вкл/Выкл", width=10,
+                           command=lambda idx=i: self.toggle_relay(idx))
+            btn.grid(row=i, column=2, padx=5, pady=5)
+
+        # Переключение между автоматическим и ручным режимами
+        frame_control = ttk.LabelFrame(tab_main, text="Управление")
+        frame_control.grid(row=2, column=0, padx=10, pady=10, sticky='ew')
+        ttk.Radiobutton(frame_control, text="Автоматический режим",
+                        variable=self.auto_mode, value=True,
+                        command=self.toggle_mode).grid(row=0, column=0, padx=10, pady=5, sticky='w')
+        ttk.Radiobutton(frame_control, text="Ручной режим",
+                        variable=self.auto_mode, value=False,
+                        command=self.toggle_mode).grid(row=0, column=1, padx=10, pady=5, sticky='w')
+
+        # Группа управления в ручном режиме
+        frame_manual = ttk.LabelFrame(frame_control, text="Ручное управление")
+        frame_manual.grid(row=1, column=0, columnspan=2, padx=10, pady=10, sticky='ew')
+        ttk.Button(frame_manual, text="Выключить все", width=15,
+                  command=lambda: self.send_command("ALL_OFF")).grid(row=0, column=0, padx=5, pady=5)
+        ttk.Button(frame_manual, text="Включить все", width=15,
+                  command=lambda: self.send_command("ALL_ON")).grid(row=0, column=1, padx=5, pady=5)
+        ttk.Label(frame_manual, text="Количество ламп:").grid(row=1, column=0, padx=5, pady=5, sticky='e')
+        spin_level = ttk.Spinbox(frame_manual, from_=0, to=3, width=5, textvariable=self.manual_level)
+        spin_level.grid(row=1, column=1, padx=5, pady=5)
+        ttk.Button(frame_manual, text="Установить", width=15,
+                  command=self.set_manual_level).grid(row=1, column=2, padx=5, pady=5)
+
+        # Резерв для будущей реализации диммирования (ШИМ)
+        frame_brightness = ttk.LabelFrame(frame_control, text="Яркость (для диммируемых ламп)")
+        frame_brightness.grid(row=2, column=0, columnspan=2, padx=10, pady=10, sticky='ew')
+        ttk.Label(frame_brightness, text="Уровень яркости:").grid(row=0, column=0, padx=5, pady=5, sticky='e')
+        self.brightness_scale = ttk.Scale(frame_brightness, from_=0, to=100, orient=tk.HORIZONTAL,
+                                         variable=self.brightness_level, length=200,
+                                         command=self.update_brightness)
+        self.brightness_scale.grid(row=0, column=1, padx=5, pady=5)
+        ttk.Label(frame_brightness, textvariable=self.brightness_level).grid(row=0, column=2, padx=5, pady=5)
+        ttk.Button(frame_brightness, text="Применить", width=15,
+                  command=self.apply_brightness).grid(row=0, column=3, padx=5, pady=5)
+
+        # ====== ВКЛАДКА "НАСТРОЙКИ" ======
+        frame_auto_settings = ttk.LabelFrame(tab_settings, text="Пороги автоматического режима")
+        frame_auto_settings.grid(row=0, column=0, padx=10, pady=10, sticky='ew')
+
+        # Три регулятора порогов с ползунками (Scale) для интуитивной настройки
+        for i, (name, var) in enumerate([("Порог для 1 лампы:", self.threshold1),
+                                        ("Порог для 2 ламп:", self.threshold2),
+                                        ("Порог для 3 ламп:", self.threshold3)], start=0):
+            ttk.Label(frame_auto_settings, text=name).grid(row=i, column=0, padx=5, pady=5, sticky='w')
+            ttk.Scale(frame_auto_settings, from_=100, to=900, orient=tk.HORIZONTAL,
+                     variable=var, length=300,
+                     command=lambda v, t=f"T{i+1}": self.update_threshold(t)).grid(row=i, column=1, padx=5, pady=5)
+            ttk.Label(frame_auto_settings, textvariable=var).grid(row=i, column=2, padx=5, pady=5)
+
+        # Справочная информация: отображение логики работы порогов
+        frame_threshold_info = ttk.LabelFrame(tab_settings, text="Информация о порогах")
+        frame_threshold_info.grid(row=1, column=0, padx=10, pady=10, sticky='ew')
+        info_text = """
+        Как работают пороги:
+        • Если освещенность > Порог 1: все лампы выключены
+        • Если Порог 2 < освещенность <= Порог 1: включена 1 лампа
+        • Если Порог 3 < освещенность <= Порог 2: включены 2 лампы
+        • Если освещенность <= Порог 3: включены все 3 лампы
+        
+        Гистерезис (разница для включения/выключения): 20 люкс
+        Это предотвращает частое переключение при уровне освещенности около пороговых значений.
+        """
+        ttk.Label(frame_threshold_info, text=info_text, justify=tk.LEFT).pack(padx=10, pady=10)
+
+        # Функции сохранения/загрузки конфигурации — важный элемент для повторяемости экспериментов
+        ttk.Button(tab_settings, text="Сохранить настройки в файл", command=self.save_settings).grid(row=2, column=0, padx=10, pady=10)
+        ttk.Button(tab_settings, text="Загрузить настройки из файла", command=self.load_settings).grid(row=3, column=0, padx=10, pady=10)
+
+        # ====== ВКЛАДКА "ЛОГИ И ИСТОРИЯ" ======
+        frame_logs = ttk.LabelFrame(tab_logs, text="Системные логи")
+        frame_logs.grid(row=0, column=0, padx=10, pady=10, sticky='nsew')
+        self.log_text = scrolledtext.ScrolledText(frame_logs, height=15, width=80, wrap=tk.WORD)
+        self.log_text.grid(row=0, column=0, padx=5, pady=5, sticky='nsew')
+        btn_frame = ttk.Frame(frame_logs)
+        btn_frame.grid(row=1, column=0, padx=5, pady=5, sticky='e')
+        ttk.Button(btn_frame, text="Очистить логи", command=self.clear_logs).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="Экспорт в файл", command=self.export_logs).pack(side=tk.LEFT, padx=5)
+
+        frame_history = ttk.LabelFrame(tab_logs, text="История изменений освещенности")
+        frame_history.grid(row=1, column=0, padx=10, pady=10, sticky='nsew')
+        self.history_text = scrolledtext.ScrolledText(frame_history, height=10, width=80, wrap=tk.WORD)
+        self.history_text.grid(row=0, column=0, padx=5, pady=5, sticky='nsew')
+        tab_logs.grid_rowconfigure(0, weight=1)
+        tab_logs.grid_rowconfigure(1, weight=1)
+        tab_logs.grid_columnconfigure(0, weight=1)
+
+        # Интеграция системного логгера с GUI-окном (паттерн Observer)
+        class TextHandler(logging.Handler):
+            def __init__(self, text_widget):
+                logging.Handler.__init__(self)
+                self.text_widget = text_widget
+            def emit(self, record):
+                msg = self.format(record)
+                self.text_widget.insert(tk.END, msg + '\n')
+                self.text_widget.see(tk.END)
+
+        text_handler = TextHandler(self.log_text)
+        text_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+        logging.getLogger().addHandler(text_handler)
+
+        logging.info("Приложение запущено")
+        logging.info(f"Подключение к MQTT брокеру: {self.mqtt_broker}:{self.mqtt_port}")
+
+
+    def mqtt_loop(self):
+        """
+        Фоновый поток для поддержания MQTT-сессии.
+        Реализует robust-поведение: при разрыве соединения — автоматический реконнект.
+        Использование цикла с sleep(1) минимизирует потребление CPU.
+        """
+        while True:
+            try:
+                if not self.client.is_connected():
+                    logging.info("Попытка подключения к MQTT брокеру...")
+                    self.client.connect(self.mqtt_broker, self.mqtt_port, 60)
+                self.client.loop_start()
+                while self.client.is_connected():
+                    time.sleep(1)
+                self.client.loop_stop()
+            except Exception as e:
+                logging.error(f"Ошибка MQTT: {e}")
+                self.root.after(0, lambda: self.update_connection_status(False))
+                time.sleep(5)
+
+
+    def on_connect(self, client, userdata, flags, rc):
+        """
+        Обработчик успешного подключения к брокеру.
+        Выполняет автоматическую подписку на все топики с данными,
+        что обеспечивает получение текущего состояния устройства без запроса.
+        """
+        if rc == 0:
+            logging.info("Успешное подключение к MQTT брокеру")
+            self.is_connected = True
+            self.root.after(0, lambda: self.update_connection_status(True))
+            # Подписка только на топики с данными (не команды)
+            for topic in self.topics.values():
+                if topic not in [self.topics['command'], self.topics['autolevels'],
+                                 self.topics['manual'], self.topics['mode'],
+                                 self.topics['brightness']]:
+                    client.subscribe(topic)
+            self.request_system_info()
+        else:
+            logging.error(f"Ошибка подключения к MQTT, код: {rc}")
+            self.is_connected = False
+            self.root.after(0, lambda: self.update_connection_status(False))
+
+
+    def on_message(self, client, userdata, msg):
+        """
+        Центральный обработчик всех входящих MQTT-сообщений.
+        Десериализует полезную нагрузку, определяет тип данных по топику
+        и обновляет соответствующие компоненты GUI через thread-safe вызов root.after().
+        Поддерживает все типы сообщений, определённые в архитектуре системы.
+        """
+        try:
+            topic = msg.topic
+            payload = msg.payload.decode().strip()
+            current_time = datetime.now().strftime("%H:%M:%S")
+            self.root.after(0, lambda: self.last_update_time.set(current_time))
+
+            if topic == self.topics['data']:
+                lux_value = int(payload)
+                self.root.after(0, lambda v=lux_value: self.lux_value.set(v))
+                history_entry = f"[{current_time}] Освещенность: {lux_value} люкс\n"
+                self.root.after(0, lambda h=history_entry: self.history_text.insert(tk.END, h))
+                self.root.after(0, lambda: self.history_text.see(tk.END))
+                if self.auto_mode.get():
+                    self.root.after(0, lambda: self.update_relay_states(lux_value))
+            elif topic in [self.topics['relay1'], self.topics['relay2'], self.topics['relay3']]:
+                relay_index = ['relay1', 'relay2', 'relay3'].index(topic.split('/')[-1])
+                state = payload.upper() == "ON"
+                self.root.after(0, lambda s=state, i=relay_index: self.update_relay_indicator(i, s))
+            elif topic == self.topics['mode_status']:
+                self.root.after(0, lambda m=(payload.upper() == "AUTO"): self.auto_mode.set(m))
+            elif topic == self.topics['manual_level']:
+                self.root.after(0, lambda l=int(payload): self.manual_level.set(l))
+            elif topic == self.topics['brightness_level']:
+                self.root.after(0, lambda b=int(payload): self.brightness_level.set(b))
+            elif topic == self.topics['system_thresholds']:
+                thresholds = payload.split(',')
+                for t in thresholds:
+                    if t.startswith('T1:'): self.root.after(0, lambda v=int(t.split(':')[1]): self.threshold1.set(v))
+                    elif t.startswith('T2:'): self.root.after(0, lambda v=int(t.split(':')[1]): self.threshold2.set(v))
+                    elif t.startswith('T3:'): self.root.after(0, lambda v=int(t.split(':')[1]): self.threshold3.set(v))
+            logging.info(f"MQTT [{topic}]: {payload}")
+        except Exception as e:
+            logging.error(f"Ошибка обработки сообщения MQTT: {e}")
+
+
+    def send_command(self, command):
+        """
+        Надёжная отправка управляющей команды в брокер.
+        Включает проверку состояния подключения и обработку исключений.
+        Используется для всех типов управления: вкл/выкл, уровни, яркость.
+        """
+        if not self.client.is_connected():
+            messagebox.showerror("Ошибка", "Нет подключения к MQTT брокеру")
+            return False
+        try:
+            self.client.publish(self.topics['command'], command)
+            logging.info(f"Отправлена команда: {command}")
+            return True
+        except Exception as e:
+            logging.error(f"Ошибка отправки команды: {e}")
+            messagebox.showerror("Ошибка", f"Не удалось отправить команду: {e}")
+            return False
+
+
+    def update_threshold(self, threshold_type):
+        """
+        Отправка нового порогового значения на устройство.
+        Обеспечивает синхронизацию между GUI и встроенной системой.
+        """
+        if not self.client.is_connected():
+            return
+        value = getattr(self, f"threshold{threshold_type[-1]}").get()
+        self.client.publish(self.topics['autolevels'], f"{threshold_type}:{value}")
+        logging.info(f"Обновлен порог {threshold_type}: {value}")
+
+
+    def toggle_mode(self):
+        """Переключение режима работы устройства."""
+        mode = "AUTO" if self.auto_mode.get() else "MANUAL"
+        self.client.publish(self.topics['mode'], mode)
+        logging.info(f"Режим изменен на: {mode}")
+
+
+    def set_manual_level(self):
+        """Установка количества активных ламп в ручном режиме."""
+        if self.auto_mode.get():
+            if not messagebox.askyesno("Предупреждение", "Вы находитесь в автоматическом режиме. Переключиться в ручной режим?"):
+                return
+        self.send_command(f"LEVEL:{self.manual_level.get()}")
+        logging.info(f"Установлен уровень освещения: {self.manual_level.get()}")
+
+
+    def toggle_relay(self, relay_num):
+        """Переключение отдельного реле с автоматическим переходом в ручной режим."""
+        if self.auto_mode.get():
+            if not messagebox.askyesno("Предупреждение", "Вы находитесь в автоматическом режиме. Переключиться в ручной режим?"):
+                return
+            self.auto_mode.set(False)
+            self.toggle_mode()
+        # Определение команды на основе логики последовательного включения
+        command = f"LEVEL:{relay_num}" if not getattr(self, f"relay{relay_num}_state").get() else f"LEVEL:{relay_num - 1}"
+        self.send_command(command)
+        logging.info(f"Переключение реле {relay_num}: {command}")
+
+
+    def apply_brightness(self):
+        """Применение уровня яркости (для будущих расширений)."""
+        self.send_command(f"BRIGHTNESS:{self.brightness_level.get()}")
+        logging.info(f"Установлен уровень яркости: {self.brightness_level.get()}%")
+
+
+    def update_relay_states(self, lux_value):
+        """
+        Локальная имитация логики автоматического управления.
+        Обновляет индикаторы реле в GUI на основе текущего уровня освещённости
+        и установленных порогов, что создаёт эффект мгновенной реакции даже
+        при задержках в сети.
+        """
+        t1, t2, t3 = self.threshold1.get(), self.threshold2.get(), self.threshold3.get()
+        self.update_relay_indicator(0, lux_value < t1)
+        self.update_relay_indicator(1, lux_value < t2)
+        self.update_relay_indicator(2, lux_value < t3)
+
+
+    def update_relay_indicator(self, relay_index, state):
+        """Обновление цвета индикатора реле (зелёный = включено, серый = выключено)."""
+        if relay_index < len(self.relay_indicators):
+            color = 'green' if state else 'gray'
+            self.relay_indicators[relay_index].config(bg=color)
+
+
+    def request_system_info(self):
+        """Запрос системной информации от устройства (для синхронизации при старте)."""
+        if self.client.is_connected():
+            self.client.publish(self.topics['command'], "REQUEST_INFO")
+            logging.info("Запрошенная системная информация")
+
+
+    def save_settings(self):
+        """Сохранение текущей конфигурации в JSON-файл."""
+        settings = {
+            'threshold1': self.threshold1.get(),
+            'threshold2': self.threshold2.get(),
+            'threshold3': self.threshold3.get(),
+            'brightness': self.brightness_level.get(),
+            'auto_mode': self.auto_mode.get(),
+            'manual_level': self.manual_level.get()
+        }
+        filename = f"luxmeter_settings_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        with open(filename, 'w', encoding='utf-8') as f:
+            json.dump(settings, f, ensure_ascii=False, indent=2)
+        messagebox.showinfo("Сохранение завершено", f"Настройки успешно сохранены в файл:\n{filename}")
+        logging.info(f"Настройки сохранены в файл: {filename}")
+
+
+    def load_settings(self):
+        """Загрузка конфигурации из JSON-файла с последующей синхронизацией устройства."""
+        from tkinter.filedialog import askopenfilename
+        filename = askopenfilename(title="Выберите файл с настройками",
+                                   filetypes=[("JSON файлы", "*.json"), ("Все файлы", "*.*")])
+        if not filename:
+            return
+        with open(filename, 'r', encoding='utf-8') as f:
+            settings = json.load(f)
+        # Применение настроек и синхронизация с устройством
+        for key, value in settings.items():
+            if hasattr(self, key):
+                getattr(self, key).set(value)
+                if key.startswith('threshold'):
+                    self.update_threshold(f"T{key[-1]}")
+        messagebox.showinfo("Загрузка завершена", f"Настройки успешно загружены из файла:\n{filename}")
+        logging.info(f"Настройки загружены из файла: {filename}")
+
+
+    def export_logs(self):
+        """Экспорт системных логов и истории изменений в текстовый файл."""
+        filename = f"luxmeter_logs_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+        with open(filename, 'w', encoding='utf-8') as f:
+            f.write(self.log_text.get(1.0, tk.END))
+            f.write("\n\n=== ИСТОРИЯ ИЗМЕНЕНИЙ ОСВЕЩЕННОСТИ ===\n")
+            f.write(self.history_text.get(1.0, tk.END))
+        messagebox.showinfo("Экспорт завершен", f"Логи успешно экспортированы в файл:\n{filename}")
+        logging.info(f"Логи экспортированы в файл: {filename}")
+
+
+    def clear_logs(self):
+        """Очистка окон логов."""
+        self.log_text.delete(1.0, tk.END)
+        self.history_text.delete(1.0, tk.END)
+       
