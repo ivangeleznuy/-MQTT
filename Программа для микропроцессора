@@ -1,0 +1,313 @@
+#include <ESP8266WiFi.h>     // Библиотека для работы с Wi-Fi стеком на ESP8266
+#include <PubSubClient.h>    // Лёгкая реализация MQTT-клиента для устройств с ограниченными ресурсами
+
+/*
+ * Настройки беспроводной сети (Wi-Fi):
+ * Устройство подключается к инфраструктурной сети в режиме станции (STA).
+ */
+const char* ssid = "samgtu_emp";
+const char* password = "ooChaThee4";
+
+/*
+ * Параметры подключения к публичному MQTT-брокеру Wqtt.ru:
+ * - Адрес: m3.wqtt.ru — выделенный сервер брокера
+ * - Порт: 14305 — нешифрованный TCP-порт (альтернатива 14306 — TLS)
+ * - Учётные данные: получены при регистрации на платформе wqtt.ru
+ * 
+ */
+const char* mqtt_server = "m3.wqtt.ru";
+const int mqtt_port = 14305;
+const char* mqtt_username = "u_3ILZ4H";
+const char* mqtt_password = "YHuF46hH";
+
+/*
+ * Конфигурация аппаратных интерфейсов микроконтроллера ESP8266:
+ * - A0: аналоговый вход (10-битный АЦП, диапазон 0–1023) для подключения фоторезистора,
+ *       включённого в схему делителя напряжения с опорным резистором 10 кОм.
+ * - GPIO4, GPIO16, GPIO5: цифровые выходы для управления катушками трёх реле.
+ * 
+ * Примечание: Нумерация пинов соответствует физическим GPIO ESP8266,
+ * а не меткам на платах типа NodeMCU (например, D2 = GPIO4).
+ */
+const int photoresistorPin = A0;  // Аналоговый вход для датчика освещённости
+const int relayPin1 = 4;          // Управление первой лампой
+const int relayPin2 = 16;         // Управление второй лампой
+const int relayPin3 = 5;          // Управление третьей лампой
+
+/*
+ * Глобальные переменные состояния системы:
+ * - currentLevel: текущее значение освещённости в условных единицах (после обработки)
+ * - relayStateX: логическое состояние каждого реле (HIGH/LOW), используемое для предотвращения дребезга и ложных переключений
+ */
+int currentLevel = 0;
+int relayState1 = LOW;
+int relayState2 = LOW;
+int relayState3 = LOW;
+
+/*
+ * Сетевые объекты:
+ * - espClient: экземпляр TCP-клиента на базе lwIP-стека ESP8266
+ * - client: MQTT-клиент с привязкой к TCP-соединению
+ */
+WiFiClient espClient;
+PubSubClient client(espClient);
+
+/*
+ * Параметры автоматического режима управления освещением:
+ * - autoMode: флаг, определяющий активность алгоритма управления на основе пороговых значений
+ * - thresholdX: критические уровни освещённости (в условных единицах), при достижении которых
+ *   происходит включение/выключение соответствующей лампы
+ * - hysteresis: зона нечувствительности (гистерезис) в единицах измерения,
+ *   предотвращающая частые переключения при значениях, близких к пороговым
+ */
+bool autoMode = true;
+int threshold1 = 50;   // Порог для включения первой лампы
+int threshold2 = 50;   // Порог для включения второй лампы
+int threshold3 = 50;   // Порог для включения третьей лампы
+int hysteresis = 20;   // Гистерезис (рекомендуемое значение: 10–30)
+
+/*
+ * Параметры ручного режима:
+ * - manualLevel: целочисленное значение (0–3), определяющее количество активных ламп
+ * - brightnessLevel: условный уровень яркости (реализация диммирования не предусмотрена
+ *   для электромеханических реле, но зарезервирована для будущих расширений с использованием ШИМ)
+ */
+int manualLevel = 0;
+int brightnessLevel = 100;
+
+/*
+ * Функция инициализации подключения к Wi-Fi сети:
+ * Используется асинхронный цикл опроса состояния подключения.
+ * Максимальное время ожидания — 10 секунд (20 попыток × 500 мс).
+ * При успешном подключении выводится локальный IPv4-адрес, присвоенный DHCP-сервером.
+ */
+void connectToWifi() {
+  Serial.println("Подключение к Wi-Fi...");
+  WiFi.begin(ssid, password);
+  
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nWi-Fi подключен!");
+    Serial.print("IP адрес: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("\nОшибка подключения к Wi-Fi!");
+  }
+}
+
+/*
+ * Функция установления MQTT-сессии:
+ * Реализует реконнект-логику в случае разрыва соединения.
+ * Используется аутентификация по логину и паролю (метод CONNECT с полями username/password).
+ * После успешного подключения клиент подписывается на следующие топики:
+ *   - luxmeter/command      — управляющие команды (вкл/выкл, уровень)
+ *   - luxmeter/autolevels   — динамическая настройка порогов
+ *   - luxmeter/manual       — установка ручного режима
+ *   - luxmeter/mode         — переключение между режимами
+ *   - luxmeter/brightness   — управление яркостью (резерв)
+ */
+void connectToMqtt() {
+  Serial.print("Подключение к MQTT брокеру...");
+  
+  while (!client.connected()) {
+    if (client.connect("ESP8266LuxMeter", mqtt_username, mqtt_password)) {
+      Serial.println(" подключено");
+      client.subscribe("luxmeter/command");
+      client.subscribe("luxmeter/autolevels");
+      client.subscribe("luxmeter/manual");
+      client.subscribe("luxmeter/mode");
+      client.subscribe("luxmeter/brightness");
+    } else {
+      Serial.print(" ошибка, код=");
+      Serial.print(client.state());
+      Serial.println(". Повтор через 5 секунд");
+      delay(5000);
+    }
+  }
+}
+
+/*
+ * Callback-функция обработки входящих MQTT-сообщений:
+ * Вызывается при получении данных по любому из подписанных топиков.
+ * Реализует конечный автомат управления выходами и конфигурацией.
+ * Поддерживает:
+ *   - Бинарное управление (ALL_ON/ALL_OFF)
+ *   - Градуированное управление (LEVEL:0–3)
+ *   - Динамическую перенастройку порогов (T1/T2/T3)
+ *   - Переключение между автоматическим и ручным режимами
+ */
+void callback(char* topic, byte* payload, unsigned int length) {
+  String message = "";
+  for (int i = 0; i < length; i++) {
+    message += (char)payload[i];
+  }
+  
+  Serial.print("Получено сообщение [");
+  Serial.print(topic);
+  Serial.print("]: ");
+  Serial.println(message);
+
+  if (strcmp(topic, "luxmeter/command") == 0) {
+    if (message == "ALL_ON") {
+      digitalWrite(relayPin1, HIGH); digitalWrite(relayPin2, HIGH); digitalWrite(relayPin3, HIGH);
+      relayState1 = relayState2 = relayState3 = HIGH;
+      autoMode = false;
+      Serial.println("Все реле включены");
+    } 
+    else if (message == "ALL_OFF") {
+      digitalWrite(relayPin1, LOW); digitalWrite(relayPin2, LOW); digitalWrite(relayPin3, LOW);
+      relayState1 = relayState2 = relayState3 = LOW;
+      autoMode = false;
+      Serial.println("Все реле выключены");
+    }
+    else if (message.startsWith("LEVEL:")) {
+      int level = message.substring(6).toInt();
+      autoMode = false;
+      manualLevel = level;
+      Serial.print("Ручной режим. Уровень освещения: "); Serial.println(level);
+      
+      // Логика градуированного включения
+      digitalWrite(relayPin1, (level >= 1) ? HIGH : LOW);
+      digitalWrite(relayPin2, (level >= 2) ? HIGH : LOW);
+      digitalWrite(relayPin3, (level >= 3) ? HIGH : LOW);
+      relayState1 = (level >= 1) ? HIGH : LOW;
+      relayState2 = (level >= 2) ? HIGH : LOW;
+      relayState3 = (level >= 3) ? HIGH : LOW;
+    }
+    else if (message.startsWith("BRIGHTNESS:")) {
+      brightnessLevel = constrain(message.substring(11).toInt(), 0, 100);
+      Serial.print("Установлен уровень яркости: "); Serial.println(brightnessLevel);
+    }
+  }
+  else if (strcmp(topic, "luxmeter/autolevels") == 0) {
+    if (message.startsWith("T1:")) threshold1 = message.substring(3).toInt();
+    else if (message.startsWith("T2:")) threshold2 = message.substring(3).toInt();
+    else if (message.startsWith("T3:")) threshold3 = message.substring(3).toInt();
+    Serial.print("Пороги обновлены: "); Serial.print(threshold1); Serial.print(", "); Serial.print(threshold2); Serial.print(", "); Serial.println(threshold3);
+  }
+  else if (strcmp(topic, "luxmeter/manual") == 0) {
+    manualLevel = constrain(message.toInt(), 0, 3);
+    autoMode = false;
+    Serial.print("Ручной режим. Количество ламп: "); Serial.println(manualLevel);
+  }
+  else if (strcmp(topic, "luxmeter/mode") == 0) {
+    autoMode = (message == "AUTO");
+    Serial.println(autoMode ? "Режим: АВТОМАТИЧЕСКИЙ" : "Режим: РУЧНОЙ");
+  }
+  else if (strcmp(topic, "luxmeter/brightness") == 0) {
+    brightnessLevel = constrain(message.toInt(), 0, 100);
+    Serial.print("Уровень яркости: "); Serial.println(brightnessLevel);
+  }
+}
+
+/*
+ * Основная функция инициализации (setup):
+ * Выполняется один раз при включении или сбросе микроконтроллера.
+ * Последовательность:
+ *   1. Инициализация последовательного порта для отладки (9600 бод)
+ *   2. Конфигурация GPIO как выходов и установка начального состояния
+ *   3. Подключение к Wi-Fi и MQTT-брокеру
+ *   4. Публикация служебной информации о системе
+ */
+void setup() {
+  Serial.begin(9600);
+  delay(100);
+  Serial.println("\n\nУмный люксметр запущен");
+  
+  pinMode(relayPin1, OUTPUT);
+  pinMode(relayPin2, OUTPUT);
+  pinMode(relayPin3, OUTPUT);
+  digitalWrite(relayPin1, LOW);
+  digitalWrite(relayPin2, LOW);
+  digitalWrite(relayPin3, LOW);
+  
+  connectToWifi();
+  client.setServer(mqtt_server, mqtt_port);
+  client.setCallback(callback);
+  connectToMqtt();
+  publishSystemInfo();
+}
+
+/*
+ * Основной цикл программы (loop):
+ * Выполняется бесконечно с частотой ~10 Гц (задержка 100 мс).
+ * Этапы:
+ *   1. Поддержание MQTT-сессии
+ *   2. Считывание аналогового сигнала с фоторезистора
+ *   3. Аппроксимация люксового значения с использованием экспоненциальной модели
+ *   4. Публикация телеметрии раз в секунду (по таймеру millis)
+ *   5. Управление реле в зависимости от режима работы
+ */
+void loop() {
+  if (!client.connected()) connectToMqtt();
+  client.loop();
+  
+  // Считывание сырого значения АЦП (0–1023)
+  int rawValue = analogRead(photoresistorPin);
+  
+  // Аппроксимация освещённости (люксы) на основе эмпирической формулы:
+  // I = I₀·e^(–k·V), где V — напряжение на делителе (пропорционально rawValue)
+  // Коэффициенты подобраны экспериментально для типичного CdS-фоторезистора
+  currentLevel = (int)(1096.7f * expf(-0.007f * (float)rawValue));
+  
+  // Публикация данных раз в 1000 мс
+  static unsigned long lastPublish = 0;
+  if (millis() - lastPublish > 1000) {
+    lastPublish = millis();
+    String luxMessage = String(currentLevel);
+    client.publish("luxmeter/data", luxMessage.c_str());
+    publishRelayStates();
+    Serial.print("Освещённость: "); Serial.print(currentLevel); Serial.println(" люкс");
+  }
+  
+  // Алгоритм автоматического управления с гистерезисом
+  if (autoMode) {
+    // Логика для каждой лампы: включение при уровне < (порог – гистерезис),
+    // выключение при уровне > (порог + гистерезис)
+    #define UPDATE_RELAY(relayPin, relayState, threshold) \
+      if (currentLevel < (threshold - hysteresis) && relayState == LOW) { \
+        digitalWrite(relayPin, HIGH); relayState = HIGH; \
+        Serial.println("Включена лампа " #relayPin); \
+      } else if (currentLevel > (threshold + hysteresis) && relayState == HIGH) { \
+        digitalWrite(relayPin, LOW); relayState = LOW; \
+        Serial.println("Выключена лампа " #relayPin); \
+      }
+
+    UPDATE_RELAY(relayPin1, relayState1, threshold1);
+    UPDATE_RELAY(relayPin2, relayState2, threshold2);
+    UPDATE_RELAY(relayPin3, relayState3, threshold3);
+  }
+  
+  delay(100);
+}
+
+/*
+ * Функция публикации состояния исполнительных устройств:
+ * Отправляет в MQTT-топики текущие состояния реле, режим работы и параметры.
+ * Это позволяет клиентскому приложению синхронизировать GUI без запроса состояния.
+ */
+void publishRelayStates() {
+  client.publish("luxmeter/relay1", (relayState1 == HIGH) ? "ON" : "OFF");
+  client.publish("luxmeter/relay2", (relayState2 == HIGH) ? "ON" : "OFF");
+  client.publish("luxmeter/relay3", (relayState3 == HIGH) ? "ON" : "OFF");
+  client.publish("luxmeter/mode/status", autoMode ? "AUTO" : "MANUAL");
+  client.publish("luxmeter/manual/level", String(manualLevel).c_str());
+  client.publish("luxmeter/brightness/level", String(brightnessLevel).c_str());
+}
+
+/*
+ * Функция публикации служебной информации:
+ * Передаёт версию прошивки и начальные пороговые значения.
+ * Используется клиентом для первоначальной инициализации GUI.
+ */
+void publishSystemInfo() {
+  client.publish("luxmeter/system/info", "ESP8266 Luxmeter v1.0");
+  String thresholds = "T1:" + String(threshold1) + ",T2:" + String(threshold2) + ",T3:" + String(threshold3);
+  client.publish("luxmeter/system/thresholds", thresholds.c_str());
+}
